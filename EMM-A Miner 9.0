@@ -46,6 +46,9 @@ string carrierConnectorName = "EMM-A Ca Connector";
 string carrierRemoteName = "EMM-A Ca Remote Control";
 string minerConnectorName = "EMM-A Mi Connector";
 string minerRemoteName = "EMM-A Mi Remote Control";
+string carrierMergerName = "EMM-A Ca Merger";
+string minerMergerName = "EMM-A Mi Merger";
+bool dockUseMergerAssist = true;
 string dockBroadcastTag = "EMM_A_DOCK_POSE";
 double dockPoseDistance = 50.0;
 double dockApproachSpeed = 4.0;
@@ -53,6 +56,8 @@ double dockFinalSpeed = 1.0;
 double dockPoseGateDistance = 50.0;
 double dockPoseTolerance = 0.6;
 double dockPoseFreshSeconds = 5.0;
+double dockConnectDistance = 0.35;
+double dockConnectAlignToleranceDeg = 0.5;
 // =============================================
 
 IMyShipController rc;
@@ -134,6 +139,8 @@ double secondsPerTick = 1.0 / 60.0;
 IMyShipConnector minerConnector;
 IMyShipConnector carrierConnector;
 IMyRemoteControl carrierRemote;
+IMyShipMergeBlock minerMerger;
+IMyShipMergeBlock carrierMerger;
 IMyBroadcastListener dockListener;
 Vector3D carrierConnectorPos = Vector3D.Zero;
 Vector3D carrierConnectorForward = Vector3D.Zero;
@@ -177,6 +184,8 @@ public Program ()
     minerConnector = GetBlock<IMyShipConnector>(minerConnectorName, true) ?? GetBlock<IMyShipConnector>();
     carrierConnector = GetBlock<IMyShipConnector>(carrierConnectorName, true);
     carrierRemote = GetBlock<IMyRemoteControl>(carrierRemoteName, true);
+    minerMerger = GetBlock<IMyShipMergeBlock>(minerMergerName, true);
+    carrierMerger = GetBlock<IMyShipMergeBlock>(carrierMergerName, true);
     dockListener = IGC.RegisterBroadcastListener(dockBroadcastTag);
     dockListener.SetMessageCallback("dockpose");
     UpdateConnectorOffsetLocal();
@@ -480,6 +489,7 @@ void RemoteCommand (string command)
             SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
             SetMineIndicatorSensor(false);
+            SetMergerEnabled(false);
             SetDrills(false);
             ResetMovement();
             WriteEcho();
@@ -971,6 +981,38 @@ Vector3D RemapVectorBetweenFrames(Vector3D vectorWorld, Vector3D fromRight, Vect
     return toRight * r + toUp * u + toForward * f;
 }
 
+bool IsConnectorAlignmentReady(double toleranceDeg)
+{
+    if (minerConnector == null)
+        return false;
+    double minDot = Math.Cos(Math.Max(0.1, toleranceDeg) * Math.PI / 180.0);
+    Vector3D minerForward = Vector3D.Normalize(minerConnector.WorldMatrix.Forward);
+    Vector3D minerUp = Vector3D.Normalize(minerConnector.WorldMatrix.Up);
+    return Vector3D.Dot(minerForward, -carrierConnectorForward) >= minDot &&
+           Vector3D.Dot(minerUp, carrierConnectorUp) >= minDot;
+}
+
+bool IsConnectorCloseEnoughToConnect()
+{
+    if (minerConnector == null)
+        return false;
+    return Vector3D.DistanceSquared(minerConnector.GetPosition(), carrierConnectorPos) <= dockConnectDistance * dockConnectDistance;
+}
+
+bool IsMergerDocked()
+{
+    return dockUseMergerAssist &&
+           minerMerger != null &&
+           carrierMerger != null &&
+           minerMerger.IsConnected;
+}
+
+void SetMergerEnabled(bool enabled)
+{
+    if (minerMerger != null)
+        minerMerger.Enabled = enabled && dockUseMergerAssist;
+}
+
 void StartUndock()
 {
     if (!HasFreshCarrierPose())
@@ -986,6 +1028,7 @@ void StartUndock()
 
     UpdateConnectorOffsetLocal();
     minerConnector.Disconnect();
+    SetMergerEnabled(false);
     SetDockingDesiredRcAxes();
     targetPosition = GetDockPosePosition();
     hasTarget = true;
@@ -1010,6 +1053,7 @@ void StartDock()
     }
 
     UpdateConnectorOffsetLocal();
+    SetMergerEnabled(true);
     Vector3D dockPose = GetDockPosePosition();
     double distToPose = Vector3D.Distance(minerConnector.GetPosition(), dockPose);
     if (distToPose > dockPoseGateDistance)
@@ -1040,6 +1084,13 @@ void UpdateDockingState()
     SetDockingDesiredRcAxes();
     if (dockingState == DockingState.UndockingToPose)
     {
+        if (!IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
+        {
+            targetPosition = minerConnector.GetPosition();
+            activeMaxSpeed = 0;
+            autopilotEnabled = true;
+            return;
+        }
         targetPosition = GetDockPosePosition();
         activeMaxSpeed = dockApproachSpeed;
         autopilotEnabled = true;
@@ -1050,6 +1101,13 @@ void UpdateDockingState()
 
     if (dockingState == DockingState.DockingToPose)
     {
+        if (!IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
+        {
+            targetPosition = minerConnector.GetPosition();
+            activeMaxSpeed = 0;
+            autopilotEnabled = true;
+            return;
+        }
         targetPosition = GetDockPosePosition();
         activeMaxSpeed = dockApproachSpeed;
         autopilotEnabled = true;
@@ -1066,7 +1124,12 @@ void UpdateDockingState()
         targetPosition = carrierConnectorPos;
         activeMaxSpeed = dockFinalSpeed;
         autopilotEnabled = true;
-        if (minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connected)
+        bool readyToConnect = IsConnectorAlignmentReady(dockConnectAlignToleranceDeg) && IsConnectorCloseEnoughToConnect();
+        if (readyToConnect && minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connectable)
+            minerConnector.Connect();
+
+        bool connectorDocked = minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connected;
+        if (connectorDocked || IsMergerDocked())
             CompleteDocking("Dock complete (connected).");
     }
 }
