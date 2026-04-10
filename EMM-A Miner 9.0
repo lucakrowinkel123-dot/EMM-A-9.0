@@ -15,6 +15,8 @@
 // pathpause : pauses queue and active movement; minearea returns to current anchor and waits
 // pathcontinue : resumes queue advancement after pathpause
 // pathstop : stops path mode and clears remaining queued records
+// dock : starts auto-dock sequence (requires fresh carrier connector broadcast and proximity to dock pose)
+// undock : disconnects and flies to shared dock pose while staying aligned
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
@@ -40,6 +42,17 @@ int maxStuckRetries = 3; // skip hole after this many stuck retries; 0 = retry f
 double pathRecordMeters = 25.0;
 double pathRecordMineDepth = 30.0;
 string pathRecordMineSensorTag = "EMM-A";
+string carrierConnectorName = "EMM-A Ca Connector";
+string carrierRemoteName = "EMM-A Ca Remote Control";
+string minerConnectorName = "EMM-A Mi Connector";
+string minerRemoteName = "EMM-A Mi Remote Control";
+string dockBroadcastTag = "EMM_A_DOCK_POSE";
+double dockPoseDistance = 50.0;
+double dockApproachSpeed = 4.0;
+double dockFinalSpeed = 1.0;
+double dockPoseGateDistance = 50.0;
+double dockPoseTolerance = 0.6;
+double dockPoseFreshSeconds = 5.0;
 // =============================================
 
 IMyShipController rc;
@@ -118,6 +131,24 @@ bool stuckBackout = false;
 const double stuckTimeoutSeconds = 5.0;
 const double stuckMoveThreshold = 0.25;
 double secondsPerTick = 1.0 / 60.0;
+IMyShipConnector minerConnector;
+IMyShipConnector carrierConnector;
+IMyRemoteControl carrierRemote;
+IMyBroadcastListener dockListener;
+Vector3D carrierConnectorPos = Vector3D.Zero;
+Vector3D carrierConnectorForward = Vector3D.Zero;
+Vector3D carrierConnectorUp = Vector3D.Zero;
+double carrierPoseAgeSeconds = 9999;
+Vector3D connectorOffsetLocal = Vector3D.Zero;
+
+enum DockingState
+{
+    None,
+    UndockingToPose,
+    DockingToPose,
+    DockingFinalApproach
+}
+DockingState dockingState = DockingState.None;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -143,6 +174,12 @@ public Program ()
     thrust = new ThrusterControl(rc, tickSpeed, GetBlocks<IMyThrust>());
     gyros = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
+    minerConnector = GetBlock<IMyShipConnector>(minerConnectorName, true) ?? GetBlock<IMyShipConnector>();
+    carrierConnector = GetBlock<IMyShipConnector>(carrierConnectorName, true);
+    carrierRemote = GetBlock<IMyRemoteControl>(carrierRemoteName, true);
+    dockListener = IGC.RegisterBroadcastListener(dockBroadcastTag);
+    dockListener.SetMessageCallback("dockpose");
+    UpdateConnectorOffsetLocal();
 
     if (tickSpeed == UpdateFrequency.Update10)
     { secondsPerTick = 10.0 / 60.0; echoFrequency = 10; }
@@ -165,6 +202,7 @@ public void Main (string argument, UpdateType updateSource)
 {
     if (updateSource == UpdateType.Update100 || updateSource == UpdateType.Update10 || updateSource == UpdateType.Update1)
     {
+        UpdateDockPoseFromBroadcast();
         if (runtime % echoFrequency == 0)
         {
             WriteEcho();
@@ -173,6 +211,8 @@ public void Main (string argument, UpdateType updateSource)
 
         if (miningEnabled)
             UpdateMiningState();
+        if (dockingState != DockingState.None)
+            UpdateDockingState();
 
         bool usedSoftLock = UpdatePathRecordState();
 
@@ -217,6 +257,8 @@ void WriteEcho()
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     if (pathMode)
         sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
+    sb.AppendLine($"Docking: {dockingState}");
+    sb.AppendLine($"Carrier pose age: {carrierPoseAgeSeconds:0.0}s");
     sb.AppendLine("Faceforward = look toward target");
     sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
 
@@ -225,7 +267,7 @@ void WriteEcho()
 
 void Move ()
 {
-    Vector3D worldOffset = GetTargetOffsetWorld();
+    Vector3D worldOffset = GetActiveTargetOffsetWorld();
     Vector3D position = rc.GetPosition() + worldOffset;
     Vector3D toTarget = targetPosition - position;
     double tolerance = Math.Max(0.05, arrivalTolerance);
@@ -265,6 +307,19 @@ Vector3D GetTargetOffsetWorld()
 {
     MatrixD wm = rc.WorldMatrix;
     return wm.Right * TOFFR + wm.Up * TOFFU + wm.Forward * TOFFF;
+}
+
+Vector3D GetDockConnectorOffsetWorld()
+{
+    MatrixD wm = rc.WorldMatrix;
+    return wm.Right * connectorOffsetLocal.X + wm.Up * connectorOffsetLocal.Y + wm.Forward * connectorOffsetLocal.Z;
+}
+
+Vector3D GetActiveTargetOffsetWorld()
+{
+    if (dockingState != DockingState.None)
+        return GetDockConnectorOffsetWorld();
+    return GetTargetOffsetWorld();
 }
 
 bool IsOrientationAligned(Vector3D forward, Vector3D up, double toleranceDeg)
@@ -421,6 +476,7 @@ void RemoteCommand (string command)
             pathRecordingPaused = false;
             pathRecordingWaitReturn = false;
             pathRecordMineStage = PathRecordMineStage.Idle;
+            dockingState = DockingState.None;
             SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
             SetMineIndicatorSensor(false);
@@ -499,6 +555,12 @@ void RemoteCommand (string command)
             pathRecords.Clear();
             pathIndex = 0;
             Echo("Path mode stopped.");
+            break;
+        case "dock":
+            StartDock();
+            break;
+        case "undock":
+            StartUndock();
             break;
         case "toffreset":
             TOFFR = 0;
@@ -779,6 +841,8 @@ void UpdatePathRunner()
 
     if (miningEnabled)
         return;
+    if (dockingState != DockingState.None)
+        return;
 
     if (autopilotEnabled && hasTarget)
     {
@@ -792,6 +856,181 @@ void UpdatePathRunner()
     }
 
     StartNextPathRecord();
+}
+
+void UpdateDockPoseFromBroadcast()
+{
+    if (dockListener == null)
+        return;
+
+    while (dockListener.HasPendingMessage)
+    {
+        MyIGCMessage msg = dockListener.AcceptMessage();
+        string payload = msg.Data as string;
+        Vector3D pos, forward, up;
+        if (!TryParseDockPosePayload(payload, out pos, out forward, out up))
+            continue;
+        carrierConnectorPos = pos;
+        carrierConnectorForward = Vector3D.Normalize(forward);
+        carrierConnectorUp = Vector3D.Normalize(up);
+        carrierPoseAgeSeconds = 0;
+    }
+
+    carrierPoseAgeSeconds += secondsPerTick;
+}
+
+bool TryParseDockPosePayload(string payload, out Vector3D pos, out Vector3D forward, out Vector3D up)
+{
+    pos = Vector3D.Zero;
+    forward = Vector3D.Zero;
+    up = Vector3D.Zero;
+    if (string.IsNullOrWhiteSpace(payload))
+        return false;
+
+    string[] parts = payload.Split('|');
+    if (parts.Length != 3)
+        return false;
+    return TryParseVector3(parts[0], out pos) && TryParseVector3(parts[1], out forward) && TryParseVector3(parts[2], out up);
+}
+
+bool HasFreshCarrierPose()
+{
+    return carrierConnectorForward.LengthSquared() > 0.001 &&
+           carrierConnectorUp.LengthSquared() > 0.001 &&
+           carrierPoseAgeSeconds <= dockPoseFreshSeconds;
+}
+
+Vector3D GetDockPosePosition()
+{
+    return carrierConnectorPos + carrierConnectorForward * dockPoseDistance;
+}
+
+void UpdateConnectorOffsetLocal()
+{
+    if (rc == null || minerConnector == null)
+        return;
+    Vector3D delta = minerConnector.GetPosition() - rc.GetPosition();
+    MatrixD wm = rc.WorldMatrix;
+    connectorOffsetLocal = new Vector3D(Vector3D.Dot(delta, wm.Right), Vector3D.Dot(delta, wm.Up), Vector3D.Dot(delta, wm.Forward));
+}
+
+void StartUndock()
+{
+    if (!HasFreshCarrierPose())
+    {
+        Echo("Undock denied: no fresh carrier connector pose broadcast.");
+        return;
+    }
+    if (minerConnector == null)
+    {
+        Echo("Undock denied: miner connector not found.");
+        return;
+    }
+
+    UpdateConnectorOffsetLocal();
+    minerConnector.Disconnect();
+    desiredUp = carrierConnectorUp;
+    desiredForward = -carrierConnectorForward;
+    targetPosition = GetDockPosePosition();
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = dockApproachSpeed;
+    dockingState = DockingState.UndockingToPose;
+    miningEnabled = false;
+    Echo("Undock started.");
+}
+
+void StartDock()
+{
+    if (!HasFreshCarrierPose())
+    {
+        Echo("Dock denied: no fresh carrier connector pose broadcast.");
+        return;
+    }
+    if (minerConnector == null)
+    {
+        Echo("Dock denied: miner connector not found.");
+        return;
+    }
+
+    UpdateConnectorOffsetLocal();
+    Vector3D dockPose = GetDockPosePosition();
+    double distToPose = Vector3D.Distance(minerConnector.GetPosition(), dockPose);
+    if (distToPose > dockPoseGateDistance)
+    {
+        Echo($"Dock denied: {distToPose:0.0}m from dock pose (max {dockPoseGateDistance:0.0}m).");
+        return;
+    }
+
+    desiredUp = carrierConnectorUp;
+    desiredForward = -carrierConnectorForward;
+    targetPosition = dockPose;
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = dockApproachSpeed;
+    dockingState = DockingState.DockingToPose;
+    miningEnabled = false;
+    Echo("Dock started (phase 1: dock pose).");
+}
+
+void UpdateDockingState()
+{
+    if (!HasFreshCarrierPose())
+    {
+        Echo("Docking paused: awaiting fresh carrier pose.");
+        autopilotEnabled = false;
+        return;
+    }
+
+    desiredUp = carrierConnectorUp;
+    desiredForward = -carrierConnectorForward;
+    if (dockingState == DockingState.UndockingToPose)
+    {
+        targetPosition = GetDockPosePosition();
+        activeMaxSpeed = dockApproachSpeed;
+        autopilotEnabled = true;
+        if (IsAtDockPose())
+            CompleteDocking("Undock complete (at dock pose).");
+        return;
+    }
+
+    if (dockingState == DockingState.DockingToPose)
+    {
+        targetPosition = GetDockPosePosition();
+        activeMaxSpeed = dockApproachSpeed;
+        autopilotEnabled = true;
+        if (IsAtDockPose())
+        {
+            dockingState = DockingState.DockingFinalApproach;
+            Echo("Dock phase 2: final approach.");
+        }
+        return;
+    }
+
+    if (dockingState == DockingState.DockingFinalApproach)
+    {
+        targetPosition = carrierConnectorPos;
+        activeMaxSpeed = dockFinalSpeed;
+        autopilotEnabled = true;
+        if (minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connected)
+            CompleteDocking("Dock complete (connected).");
+    }
+}
+
+bool IsAtDockPose()
+{
+    return Vector3D.DistanceSquared(minerConnector.GetPosition(), GetDockPosePosition()) <= dockPoseTolerance * dockPoseTolerance &&
+           IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg);
+}
+
+void CompleteDocking(string message)
+{
+    dockingState = DockingState.None;
+    autopilotEnabled = false;
+    hasTarget = false;
+    activeMaxSpeed = 0;
+    ResetMovement();
+    Echo(message);
 }
 
 void StartPathFromTimer()
@@ -846,6 +1085,16 @@ bool ExecutePathRecord(string rawRecord)
     {
         StartAreaMining(record);
         return miningEnabled;
+    }
+    if (record.Equals("dock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartDock();
+        return dockingState != DockingState.None;
+    }
+    if (record.Equals("undock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartUndock();
+        return dockingState != DockingState.None;
     }
 
     // A GPS record that contains ";" is a shorthand minearea entry from the path timer.
@@ -1403,7 +1652,7 @@ void NextHole()
 bool IsAtTargetPosition(Vector3D target)
 {
     double tolerance = Math.Max(0.05, arrivalTolerance);
-    return Vector3D.DistanceSquared(rc.GetPosition() + GetTargetOffsetWorld(), target) < tolerance * tolerance;
+    return Vector3D.DistanceSquared(rc.GetPosition() + GetActiveTargetOffsetWorld(), target) < tolerance * tolerance;
 }
 
 bool IsAtTargetPose(Vector3D target, Vector3D forward, Vector3D up)
@@ -1500,6 +1749,8 @@ void SaveState()
     sb.AppendLine("pathRecordMeters=" + pathRecordMeters.ToString("R"));
     sb.AppendLine("pathRecordMineDepth=" + pathRecordMineDepth.ToString("R"));
     sb.AppendLine("cockpitGyroForcedOff=" + (cockpitGyroControlForcedOff ? "1" : "0"));
+    sb.AppendLine("dockingState=" + (int)dockingState);
+    sb.AppendLine("connectorOffsetLocal=" + V3ToString(connectorOffsetLocal));
     Storage = sb.ToString();
 }
 
@@ -1581,6 +1832,8 @@ void LoadState()
     if (dict.TryGetValue("pathRecordMeters", out s) && double.TryParse(s, out d)) pathRecordMeters = d;
     if (dict.TryGetValue("pathRecordMineDepth", out s) && double.TryParse(s, out d)) pathRecordMineDepth = d;
     if (dict.TryGetValue("cockpitGyroForcedOff", out s)) cockpitGyroControlForcedOff = s == "1";
+    if (dict.TryGetValue("dockingState", out s) && int.TryParse(s, out n)) dockingState = (DockingState)n;
+    if (dict.TryGetValue("connectorOffsetLocal", out s) && TryParseV3(s, out v)) connectorOffsetLocal = v;
 
     // If drills were actively running when the reload happened, turn them back on
     // and reset the stuck monitor so the stuck timer starts fresh.
