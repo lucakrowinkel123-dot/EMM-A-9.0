@@ -1,0 +1,52 @@
+// Carrier dock pose broadcaster for EMM-A miner docking.
+// Sends carrier connector world position + forward/up vectors via IGC broadcast.
+// Payload format: "x,y,z|fx,fy,fz|ux,uy,uz"
+
+string carrierConnectorName = "EMM-A Ca Connector";
+string carrierRemoteName = "EMM-A Ca Remote Control";
+string dockBroadcastTag = "EMM_A_DOCK_POSE";
+double broadcastForwardOffset = 1.25;
+UpdateFrequency tickSpeed = UpdateFrequency.Update1;
+
+IMyShipConnector carrierConnector;
+IMyRemoteControl carrierRemote;
+
+public Program()
+{
+    carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
+    carrierRemote = GridTerminalSystem.GetBlockWithName(carrierRemoteName) as IMyRemoteControl;
+    Runtime.UpdateFrequency = tickSpeed;
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if (carrierConnector == null)
+        carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
+    if (carrierRemote == null)
+        carrierRemote = GridTerminalSystem.GetBlockWithName(carrierRemoteName) as IMyRemoteControl;
+
+    if (carrierConnector == null)
+    {
+        Echo("Carrier connector not found: " + carrierConnectorName);
+        return;
+    }
+
+    MatrixD m = carrierConnector.WorldMatrix;
+    Vector3D pos = carrierConnector.GetPosition();
+    Vector3D f = Vector3D.Normalize(m.Forward);
+    Vector3D u = Vector3D.Normalize(m.Up);
+    pos += f * broadcastForwardOffset;
+
+    string payload = ToCsv(pos) + "|" + ToCsv(f) + "|" + ToCsv(u);
+    IGC.SendBroadcastMessage(dockBroadcastTag, payload);
+
+    Echo("Dock pose broadcast: " + dockBroadcastTag);
+    Echo("Connector: " + carrierConnector.CustomName);
+    if (carrierRemote != null)
+        Echo("Remote: " + carrierRemote.CustomName);
+}
+
+string ToCsv(Vector3D v)
+{
+    return v.X.ToString("0.000") + "," + v.Y.ToString("0.000") + "," + v.Z.ToString("0.000");
+}
