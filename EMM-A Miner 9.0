@@ -53,6 +53,7 @@ string dockBroadcastTag = "EMM_A_DOCK_POSE";
 double dockPoseDistance = 50.0;
 double dockApproachSpeed = 4.0;
 double dockFinalSpeed = 1.0;
+double dockMisalignedSpeedFactor = 0.5; // fraction of approach speed while tracking dock pose during misalignment
 double dockPoseGateDistance = 50.0;
 double dockPoseTolerance = 0.6;
 double dockPoseFreshSeconds = 5.0;
@@ -1088,16 +1089,16 @@ void UpdateDockingState()
     }
 
     SetDockingDesiredRcAxes();
+    double misalignedTrackSpeed = Math.Max(dockFinalSpeed, dockApproachSpeed * dockMisalignedSpeedFactor);
     if (dockingState == DockingState.UndockingToPose)
     {
+        targetPosition = GetDockPosePosition();
         if (!IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
         {
-            targetPosition = minerConnector.GetPosition();
-            activeMaxSpeed = 0;
+            activeMaxSpeed = misalignedTrackSpeed;
             autopilotEnabled = true;
             return;
         }
-        targetPosition = GetDockPosePosition();
         activeMaxSpeed = dockApproachSpeed;
         autopilotEnabled = true;
         if (IsAtDockPose())
@@ -1107,14 +1108,13 @@ void UpdateDockingState()
 
     if (dockingState == DockingState.DockingToPose)
     {
+        targetPosition = GetDockPosePosition();
         if (!IsOrientationAligned(desiredForward, desiredUp, orientationToleranceDeg))
         {
-            targetPosition = minerConnector.GetPosition();
-            activeMaxSpeed = 0;
+            activeMaxSpeed = misalignedTrackSpeed;
             autopilotEnabled = true;
             return;
         }
-        targetPosition = GetDockPosePosition();
         activeMaxSpeed = dockApproachSpeed;
         autopilotEnabled = true;
         if (IsAtDockPose())
