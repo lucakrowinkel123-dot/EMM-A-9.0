@@ -58,6 +58,7 @@ double dockPoseTolerance = 0.6;
 double dockPoseFreshSeconds = 5.0;
 double dockConnectDistance = 0.35;
 double dockConnectAlignToleranceDeg = 0.5;
+double carrierPoseForwardOffset = 1.25; // broadcaster sends connector position shifted forward by this amount
 // =============================================
 
 IMyShipController rc;
@@ -912,7 +913,12 @@ bool HasFreshCarrierPose()
 
 Vector3D GetDockPosePosition()
 {
-    return carrierConnectorPos + carrierConnectorForward * dockPoseDistance;
+    return GetCarrierConnectorPosition() + carrierConnectorForward * dockPoseDistance;
+}
+
+Vector3D GetCarrierConnectorPosition()
+{
+    return carrierConnectorPos - carrierConnectorForward * carrierPoseForwardOffset;
 }
 
 void UpdateConnectorOffsetLocal()
@@ -996,7 +1002,7 @@ bool IsConnectorCloseEnoughToConnect()
 {
     if (minerConnector == null)
         return false;
-    return Vector3D.DistanceSquared(minerConnector.GetPosition(), carrierConnectorPos) <= dockConnectDistance * dockConnectDistance;
+    return Vector3D.DistanceSquared(minerConnector.GetPosition(), GetCarrierConnectorPosition()) <= dockConnectDistance * dockConnectDistance;
 }
 
 bool IsMergerDocked()
@@ -1121,7 +1127,7 @@ void UpdateDockingState()
 
     if (dockingState == DockingState.DockingFinalApproach)
     {
-        targetPosition = carrierConnectorPos;
+        targetPosition = GetCarrierConnectorPosition();
         activeMaxSpeed = dockFinalSpeed;
         autopilotEnabled = true;
         bool readyToConnect = IsConnectorAlignmentReady(dockConnectAlignToleranceDeg) && IsConnectorCloseEnoughToConnect();

@@ -5,6 +5,7 @@
 string carrierConnectorName = "EMM-A Ca Connector";
 string carrierRemoteName = "EMM-A Ca Remote Control";
 string dockBroadcastTag = "EMM_A_DOCK_POSE";
+double broadcastForwardOffset = 1.25;
 UpdateFrequency tickSpeed = UpdateFrequency.Update1;
 
 IMyShipConnector carrierConnector;
@@ -34,6 +35,7 @@ public void Main(string argument, UpdateType updateSource)
     Vector3D pos = carrierConnector.GetPosition();
     Vector3D f = Vector3D.Normalize(m.Forward);
     Vector3D u = Vector3D.Normalize(m.Up);
+    pos += f * broadcastForwardOffset;
 
     string payload = ToCsv(pos) + "|" + ToCsv(f) + "|" + ToCsv(u);
     IGC.SendBroadcastMessage(dockBroadcastTag, payload);
