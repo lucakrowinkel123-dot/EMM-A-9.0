@@ -914,6 +914,63 @@ void UpdateConnectorOffsetLocal()
     connectorOffsetLocal = new Vector3D(Vector3D.Dot(delta, wm.Right), Vector3D.Dot(delta, wm.Up), Vector3D.Dot(delta, wm.Forward));
 }
 
+void SetDockingDesiredRcAxes()
+{
+    Vector3D targetConnectorForward = -carrierConnectorForward;
+    Vector3D targetConnectorUp = carrierConnectorUp;
+    Vector3D rcForward, rcUp;
+    if (TryGetRcAxesForConnectorAlignment(targetConnectorForward, targetConnectorUp, out rcForward, out rcUp))
+    {
+        desiredForward = rcForward;
+        desiredUp = rcUp;
+    }
+    else
+    {
+        // Fallback if connector transform cannot be solved.
+        desiredForward = targetConnectorForward;
+        desiredUp = targetConnectorUp;
+    }
+}
+
+bool TryGetRcAxesForConnectorAlignment(Vector3D targetConnectorForward, Vector3D targetConnectorUp, out Vector3D rcForward, out Vector3D rcUp)
+{
+    rcForward = Vector3D.Zero;
+    rcUp = Vector3D.Zero;
+    if (rc == null || minerConnector == null)
+        return false;
+
+    Vector3D cF = Vector3D.Normalize(minerConnector.WorldMatrix.Forward);
+    Vector3D cU = Vector3D.Normalize(minerConnector.WorldMatrix.Up);
+    Vector3D cR = Vector3D.Cross(cF, cU);
+    if (cR.LengthSquared() < 0.001)
+        return false;
+    cR = Vector3D.Normalize(cR);
+
+    Vector3D tF = Vector3D.Normalize(targetConnectorForward);
+    Vector3D tU = Vector3D.Normalize(targetConnectorUp);
+    Vector3D tR = Vector3D.Cross(tF, tU);
+    if (tR.LengthSquared() < 0.001)
+        return false;
+    tR = Vector3D.Normalize(tR);
+
+    // Transform RC axes from current connector frame into target connector frame.
+    rcForward = RemapVectorBetweenFrames(rc.WorldMatrix.Forward, cR, cU, cF, tR, tU, tF);
+    rcUp = RemapVectorBetweenFrames(rc.WorldMatrix.Up, cR, cU, cF, tR, tU, tF);
+    if (rcForward.LengthSquared() < 0.001 || rcUp.LengthSquared() < 0.001)
+        return false;
+    rcForward = Vector3D.Normalize(rcForward);
+    rcUp = Vector3D.Normalize(rcUp);
+    return true;
+}
+
+Vector3D RemapVectorBetweenFrames(Vector3D vectorWorld, Vector3D fromRight, Vector3D fromUp, Vector3D fromForward, Vector3D toRight, Vector3D toUp, Vector3D toForward)
+{
+    double r = Vector3D.Dot(vectorWorld, fromRight);
+    double u = Vector3D.Dot(vectorWorld, fromUp);
+    double f = Vector3D.Dot(vectorWorld, fromForward);
+    return toRight * r + toUp * u + toForward * f;
+}
+
 void StartUndock()
 {
     if (!HasFreshCarrierPose())
@@ -929,8 +986,7 @@ void StartUndock()
 
     UpdateConnectorOffsetLocal();
     minerConnector.Disconnect();
-    desiredUp = carrierConnectorUp;
-    desiredForward = -carrierConnectorForward;
+    SetDockingDesiredRcAxes();
     targetPosition = GetDockPosePosition();
     hasTarget = true;
     autopilotEnabled = true;
@@ -962,8 +1018,7 @@ void StartDock()
         return;
     }
 
-    desiredUp = carrierConnectorUp;
-    desiredForward = -carrierConnectorForward;
+    SetDockingDesiredRcAxes();
     targetPosition = dockPose;
     hasTarget = true;
     autopilotEnabled = true;
@@ -982,8 +1037,7 @@ void UpdateDockingState()
         return;
     }
 
-    desiredUp = carrierConnectorUp;
-    desiredForward = -carrierConnectorForward;
+    SetDockingDesiredRcAxes();
     if (dockingState == DockingState.UndockingToPose)
     {
         targetPosition = GetDockPosePosition();
